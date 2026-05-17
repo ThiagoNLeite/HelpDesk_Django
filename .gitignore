@@ -1,0 +1,57 @@
+# ── Python / Django ───────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.Python
+
+# Ambiente virtual
+env/
+venv/
+.venv/
+ENV/
+
+# Django
+*.log
+db.sqlite3
+db_leitura.sqlite3
+/static/
+/media/
+.env
+local_settings.py
+
+# Migrations (opcional — mantenha se quiser histórico)
+# core/migrations/
+
+# ── Node / React ──────────────────────────────────
+node_modules/
+dist/
+.vite/
+*.local
+
+# ── Firebase ──────────────────────────────────────
+# NUNCA suba as credenciais do Firebase Admin SDK
+firebase-key.json
+.firebaserc
+firebase-debug.log
+.firebase/
+
+# ── IDEs ──────────────────────────────────────────
+.vscode/
+.idea/
+*.suo
+*.user
+
+# ── Sistema Operacional ───────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Outros ────────────────────────────────────────
+*.zip
+*.bak
