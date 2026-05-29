@@ -32,8 +32,8 @@ O HelpDesk TI é um sistema de abertura e gerenciamento de chamados técnicos pa
 │  └─────────────────────┘        └──────────────────────────────┘    │
 │                                                                      │
 │  ┌──────────────────────────────────────────────────────────────┐   │
-│  │               Django Signals (post_save)                      │   │
-│  │   Sincronização automática SQL Server ──────────→ SQLite      │   │
+│  │        Sincronização SQL Server ──────────────→ SQLite        │   │
+│  │   Signals (post_save/post_delete) + recarga total no startup  │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 └───────┬───────────────────────────┬─────────────────────┬───────────┘
         │                           │                      │
@@ -119,60 +119,84 @@ CREATE TABLE dashboard_chamados (
     id              INTEGER PRIMARY KEY,
     titulo          VARCHAR(150) NOT NULL,
     status_atual    VARCHAR(60)  NOT NULL,  -- 'Aberto', 'Em andamento', 'Fechado'
-    categoria       VARCHAR(100),           -- ex: 'Hardware', 'Rede', 'Software'
-    tempo_resolucao VARCHAR(100),           -- campo reservado para métricas futuras
-    data            DATE NOT NULL           -- data de abertura do chamado
+    categoria       VARCHAR(100),           -- copiada do SQL Server (fonte única)
+    tempo_resolucao VARCHAR(100),           -- calculado: data_fim - data_abertura
+    data            DATE                    -- data de abertura do chamado
 );
 ```
 
+> **Nota sobre `categoria` e `tempo_resolucao`:** a categoria é gravada no SQL Server (Banco 2) no momento da abertura do chamado e copiada para o SQLite na sincronização — o SQL Server é a fonte única da verdade. O `tempo_resolucao` é derivado: quando um chamado muda para "Fechado", o SQL Server registra `data_fim`, e a diferença `data_fim - data_abertura` é convertida em um texto legível (ex: "2.5 h", "3.0 dias") durante a sincronização.
+
 ---
 
-## ⚡ Método de Sincronização — Django Signals (post_save)
+## ⚡ Método de Sincronização
 
-### Qual método foi escolhido
+A sincronização entre o Banco 2 (SQL Server) e o Banco 3 (SQLite) usa **dois mecanismos complementares**, ambos implementados na própria aplicação Django:
 
-A sincronização entre o Banco 2 (SQL Server) e o Banco 3 (SQLite) é realizada via **Django Signals**, especificamente o sinal `post_save` conectado ao modelo `Chamado`.
+1. **Sincronização incremental — Django Signals (`post_save` / `post_delete`):** mantém o SQLite atualizado em tempo real a cada chamado criado, alterado ou removido.
+2. **Recarga total no startup — `management command` (`sync_leitura`):** sempre que o backend é iniciado, o SQLite é truncado e recarregado integralmente a partir do SQL Server, garantindo que os dois bancos partem sempre de um estado idêntico.
 
-### Como funciona na prática
+### 1. Sincronização incremental (tempo real)
 
 ```python
 # core/signals.py
 
-from django.db.models.signals import post_save
-from django.dispatch import receiver
-from .models import Chamado, DashboardChamados
-
 @receiver(post_save, sender=Chamado)
 def atualizar_leitura(sender, instance, created, **kwargs):
     try:
-        # Se o registro já existe no SQLite → atualiza
-        obj = DashboardChamados.objects.using('leitura').get(id=instance.id)
-        obj.titulo = instance.titulo
-        obj.status_atual = instance.status
-        obj.save(using='leitura', update_fields=['titulo', 'status_atual'])
-    except DashboardChamados.DoesNotExist:
-        # Se não existe → cria
-        DashboardChamados.objects.using('leitura').create(
-            id=instance.id,
-            titulo=instance.titulo,
-            status_atual=instance.status,
+        DashboardChamados.objects.using('leitura').update_or_create(
+            id=instance.id,                       # mesmo id do SQL Server (1:1)
+            defaults={
+                'titulo': instance.titulo,
+                'status_atual': instance.status,
+                'categoria': instance.categoria,  # copiada do SQL Server
+                'tempo_resolucao': tempo_resolucao(
+                    instance.data_abertura, instance.data_fim, instance.status
+                ),
+                'data': instance.data_abertura.date(),
+            },
         )
     except Exception as e:
         # Falha na sincronização NÃO interrompe a operação principal
-        print(f"[SIGNAL WARNING] Falha ao sincronizar chamado {instance.id}: {e}")
+        print(f"[SIGNAL WARNING] Falha ao sincronizar {instance.id}: {e}")
 ```
 
-O signal é registrado automaticamente pelo Django no startup da aplicação, através do método `ready()` do `CoreConfig` em `apps.py`:
+O uso de `update_or_create` com o mesmo `id` do SQL Server garante o alinhamento 1:1 entre os bancos — essencial para que `UPDATE` e `DELETE` por id funcionem nos dois lados. Um segundo signal (`post_delete`) remove o registro do SQLite quando o chamado é apagado.
+
+### 2. Recarga total no startup (`sync_leitura`)
+
+```python
+# core/management/commands/sync_leitura.py (resumido)
+
+class Command(BaseCommand):
+    def handle(self, *args, **options):
+        # 1. SQL Server está acessível? (timeout curto evita travar o startup)
+        try:
+            connections['default'].ensure_connection()
+        except Exception:
+            return  # SQL Server fora → preserva o SQLite, não toca em nada
+
+        # 2. Lê todos os chamados do SQL Server (com categoria e data_fim)
+        chamados = list(Chamado.objects.using('default').order_by('id').values(...))
+
+        # 3. TRUNCATE no SQLite + recarga preservando os ids
+        DashboardChamados.objects.using('leitura').all().delete()
+        DashboardChamados.objects.using('leitura').bulk_create([...])
+```
+
+O comando é disparado automaticamente no `apps.py` quando o servidor sobe:
 
 ```python
 # core/apps.py
-class CoreConfig(AppConfig):
-    name = 'core'
-    def ready(self):
-        import core.signals  # registra os signals ao iniciar o servidor
+def ready(self):
+    import core.signals  # registra os signals
+    if 'runserver' in sys.argv and os.environ.get('RUN_MAIN') == 'true':
+        call_command('sync_leitura', quiet=True)  # recarga total
 ```
 
-### Fluxo de sincronização passo a passo
+> **Por que recarregar tudo no startup?** Em um ambiente CQRS, os bancos podem divergir após uma queda (ex: o SQL Server recebeu chamados enquanto o SQLite estava fora). A recarga total no boot garante que o banco de leitura sempre começa fiel ao transacional, sem intervenção manual. Se o SQL Server estiver fora no momento do boot, a recarga é abortada com segurança e o SQLite antigo é preservado.
+
+### Fluxo de sincronização incremental, passo a passo
 
 ```
 1. Usuário abre chamado no frontend
@@ -182,17 +206,15 @@ class CoreConfig(AppConfig):
 3. Django valida o token (FirebaseMiddleware)
           ↓
 4. View cria o Chamado no SQL Server (Banco 2)
-   → Chamado.objects.create(...)
           ↓
 5. Django dispara automaticamente: post_save → atualizar_leitura()
           ↓
-6. Signal cria o registro espelhado no SQLite (Banco 3)
-   → DashboardChamados.objects.using('leitura').create(...)
+6. Signal espelha o registro no SQLite (Banco 3), mesmo id
           ↓
 7. Dashboard já pode ler os novos dados do SQLite
 ```
 
-O mesmo fluxo ocorre ao **atualizar o status** de um chamado: o `Chamado.save()` no SQL Server dispara o signal, que atualiza o `status_atual` no SQLite.
+O mesmo fluxo ocorre ao **atualizar o status**: o `Chamado.save()` dispara o signal, que atualiza `status_atual` (e recalcula `tempo_resolucao` quando o chamado é fechado).
 
 ---
 
@@ -205,6 +227,7 @@ O mesmo fluxo ocorre ao **atualizar o status** de um chamado: o `Chamado.save()`
 | Criar chamado | SQL Server | Imediata (mesma thread) | < 50ms |
 | Atualizar status | SQL Server | Imediata (mesma thread) | < 50ms |
 | Excluir chamado | SQL Server | Imediata (mesma chamada de view) | < 50ms |
+| Recarga total (startup) | — | Lote único (`bulk_create`) | proporcional ao volume |
 
 ### Por que a latência é praticamente zero
 
@@ -258,28 +281,46 @@ Com isso, as views não precisam especificar qual banco usar — o router decide
 
 ## 🛡️ Tolerância a Falhas (Fallback)
 
-A aplicação implementa degradação graciosa em caso de falha de um dos bancos:
+A aplicação implementa degradação graciosa em caso de falha de um dos bancos. O comportamento difere entre a **lista de chamados** e o **dashboard analítico**, por decisão de projeto.
 
-### Cenário A — SQLite (Banco 3) cai
+### Cenário A — SQLite (Banco 3 / Leitura) cai
 
-As views de leitura (`GET /api/chamados/` e `GET /api/dashboard/stats/`) capturam a exceção e redirecionam automaticamente para o SQL Server:
+| Funcionalidade | Comportamento |
+|----------------|---------------|
+| Login via Firebase | ✅ Continua funcionando (banco independente) |
+| Criação/edição de chamados | ✅ Continua funcionando (escreve no SQL Server) |
+| Lista de chamados (`GET /api/chamados/`) | ⚠️ Faz **fallback** para o SQL Server, com aviso de modo degradado |
+| Dashboard analítico (`GET /api/dashboard/stats/`) | ❌ **Não faz fallback** — retorna `503` e o frontend exibe uma tela limpa de "Painel indisponível" |
 
 ```python
-# views.py — chamados()
+# views.py — dashboard_stats()
 try:
-    registros = DashboardChamados.objects.using('leitura')...  # SQLite
+    qs = DashboardChamados.objects.using('leitura')   # SQLite
+    # ... monta as métricas ...
 except Exception:
-    registros = Chamado.objects.order_by(...)...               # fallback: SQL Server
-    return JsonResponse({..., 'aviso': 'Banco de leitura indisponível.'})
+    return JsonResponse(
+        {'error': 'Banco de leitura (SQLite) indisponível.', 'leitura_offline': True},
+        status=503
+    )
 ```
 
-O frontend exibe um banner de aviso `⚠ modo fallback ativo` sem interromper o funcionamento.
+> **Por que o dashboard não faz fallback?** O painel analítico é, por definição, a responsabilidade exclusiva do banco de leitura (CQRS). Servir o dashboard a partir do banco transacional anularia o propósito da separação e poderia sobrecarregar o SQL Server justamente num momento de instabilidade. A escolha de exibir uma mensagem clara, em vez de mascarar a falha, deixa o comportamento do sistema explícito durante o teste de resiliência.
 
-### Cenário B — SQL Server (Banco 2) cai
+### Cenário B — SQL Server (Banco 2 / Escrita) cai
 
-- Login via Firebase: **continua funcionando** (banco independente)
-- Leitura do dashboard: **continua funcionando** (dados do SQLite)
-- Criação/atualização de chamados: **desabilitada** com mensagem clara
+| Funcionalidade | Comportamento |
+|----------------|---------------|
+| Login via Firebase | ✅ Continua funcionando (banco independente) |
+| Dashboard e lista | ✅ Continuam funcionando (dados do SQLite) |
+| Criação/atualização/exclusão de chamados | ❌ Desabilitada, com mensagem clara `503` ("Banco de escrita indisponível") |
+
+Para que o **startup do servidor não trave** quando o SQL Server está fora, o driver ODBC é configurado com timeout curto de login (`LoginTimeout=3`). Sem isso, o Django ficaria pendurado aguardando o timeout padrão e o sistema parecia "não iniciar". Com o timeout curto, a conexão falha rápido, a recarga de startup é abortada com segurança e o sistema sobe normalmente lendo do SQLite.
+
+```python
+# settings.py — OPTIONS do SQL Server
+'extra_params': 'TrustServerCertificate=yes;LoginTimeout=3;',
+'connection_timeout': 3,
+```
 
 ---
 
@@ -290,11 +331,14 @@ setup_helpdesk/
 ├── core/
 │   ├── models.py          # Modelos: Usuario, Chamado (SQL Server) e DashboardChamados (SQLite)
 │   ├── views.py           # Endpoints da API REST
-│   ├── signals.py         # ⭐ Sincronização SQL Server → SQLite (post_save)
+│   ├── signals.py         # ⭐ Sincronização incremental SQL Server → SQLite (post_save/post_delete)
 │   ├── routers.py         # CQRS Router — roteamento automático de queries
 │   ├── middleware.py      # Validação do token Firebase em todas as escritas
 │   ├── firebase_config.py # Inicialização do Firebase Admin SDK
-│   └── apps.py            # Registro dos signals no startup do Django
+│   ├── apps.py            # Registro dos signals + recarga total no startup
+│   └── management/
+│       └── commands/
+│           └── sync_leitura.py  # ⭐ Recarga total SQL Server → SQLite (truncate + reload)
 │
 ├── setup_helpdesk/
 │   ├── settings.py        # Configuração dos 3 bancos + CORS + DATABASE_ROUTERS
@@ -330,7 +374,7 @@ setup_helpdesk/
 | `GET` | `/api/chamados/<id>/` | ❌ | SQL Server | Detalhe de um chamado |
 | `PUT` | `/api/chamados/<id>/` | ✅ Firebase | SQL Server + sync SQLite | Atualiza status |
 | `DELETE` | `/api/chamados/<id>/` | ✅ Firebase | SQL Server + SQLite | Remove chamado |
-| `GET` | `/api/dashboard/stats/` | ❌ | SQLite → fallback SQL Server | Métricas analíticas |
+| `GET` | `/api/dashboard/stats/` | ❌ | SQLite (sem fallback → 503 se cair) | Métricas analíticas |
 
 ---
 
@@ -349,11 +393,18 @@ setup_helpdesk/
 .\env\Scripts\activate          # Windows
 source env/bin/activate         # Linux/Mac
 
-python manage.py migrate --database=default   # cria tabelas no SQL Server
-python manage.py migrate --database=leitura   # cria tabelas no SQLite
+# Cria/atualiza as tabelas. As migrations já incluem as colunas
+# 'categoria' e 'data_fim' na tabela chamados (SQL Server).
+python manage.py migrate --database=default   # SQL Server
+python manage.py migrate --database=leitura   # SQLite
 
 python manage.py runserver 8000
+# No startup, o SQLite é recarregado automaticamente a partir do SQL Server.
 ```
+
+> **Alternativa para as colunas novas:** se preferir não rodar migrate no SQL Server (por já ter dados em produção), o script `alterar_sql_server.sql` adiciona `categoria` e `data_fim` à tabela `chamados` de forma idempotente.
+>
+> **Recarga manual:** a sincronização total roda sozinha no `runserver`, mas também pode ser disparada a qualquer momento com `python manage.py sync_leitura`.
 
 ### Frontend (React)
 
@@ -380,4 +431,4 @@ Os signals oferecem o melhor equilíbrio para este contexto:
 4. **Tolerante a falhas** — um erro no signal não derruba a operação principal (try/except)
 5. **Idiomático no ecossistema Django** — padrão bem documentado e amplamente usado
 
-O mecanismo de signal é ativado automaticamente no startup via `apps.py` e não requer nenhuma configuração externa, tornando o projeto completamente autocontido e fácil de executar em qualquer ambiente de desenvolvimento.
+O mecanismo de signal é ativado automaticamente no startup via `apps.py` e não requer nenhuma configuração externa. Ele é complementado pela **recarga total no startup** (`sync_leitura`), que garante que o banco de leitura sempre parte de um estado fiel ao transacional — mesmo após uma queda em que os bancos tenham divergido. Juntos, os dois mecanismos tornam o projeto completamente autocontido e fácil de executar em qualquer ambiente de desenvolvimento.

@@ -66,6 +66,30 @@ export default function Dashboard() {
     </div>
   )
 
+  // Banco de leitura (SQLite) fora do ar: mensagem simples, painel zerado.
+  // Decisão de projeto: o dashboard NÃO faz fallback para o SQL Server.
+  if (error || !stats) return (
+    <div className="page-container animate-in">
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center',
+        justifyContent: 'center', minHeight: '60vh', textAlign: 'center', gap: '1rem' }}>
+        <div style={{
+          width: 64, height: 64, borderRadius: 16,
+          background: 'var(--red, #FF4757)18', border: '1px solid #FF475740',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '1.8rem',
+        }}>⚠</div>
+        <h1 style={{ marginBottom: 0 }}>Painel indisponível</h1>
+        <p className="text-secondary" style={{ maxWidth: 460, fontSize: '0.9rem' }}>
+          O banco de leitura (SQLite) está fora do ar, então o painel analítico
+          não pode ser exibido no momento. As demais funções do sistema continuam
+          operando normalmente.
+        </p>
+        <button className="btn btn-primary" onClick={() => window.location.reload()}>
+          ↻ Tentar novamente
+        </button>
+      </div>
+    </div>
+  )
+
   const pieData = stats ? [
     { name: 'Aberto',        value: stats.abertos },
     { name: 'Em andamento',  value: stats.em_andamento },

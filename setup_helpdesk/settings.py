@@ -14,12 +14,12 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    'corsheaders',        # ← pip install django-cors-headers
+    'corsheaders',
     'core',
 ]
 
 MIDDLEWARE = [
-    'corsheaders.middleware.CorsMiddleware',   # ← deve ser o PRIMEIRO
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -30,8 +30,8 @@ MIDDLEWARE = [
     'core.middleware.FirebaseAuthenticationMiddleware',
 ]
 
-# CORS: permite o frontend React chamar a API Django
-CORS_ALLOW_ALL_ORIGINS = True          # em produção, use CORS_ALLOWED_ORIGINS
+
+CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_HEADERS = [
     'accept', 'accept-encoding', 'authorization',
@@ -68,7 +68,8 @@ DATABASES = {
         'PORT': '',
         'OPTIONS': {
             'driver': 'ODBC Driver 18 for SQL Server',
-            'extra_params': 'TrustServerCertificate=yes;',
+            'extra_params': 'TrustServerCertificate=yes;LoginTimeout=3;',
+            'connection_timeout': 3,
         },
     },
     'leitura': {
