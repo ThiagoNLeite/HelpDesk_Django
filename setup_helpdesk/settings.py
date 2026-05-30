@@ -64,7 +64,7 @@ DATABASES = {
         'NAME': 'HelpDesk',
         'USER': 'django_user',
         'PASSWORD': '@SenhaForte123',
-        'HOST': 'MEGATRON',
+        'HOST': 'SSD_Thiago',
         'PORT': '',
         'OPTIONS': {
             'driver': 'ODBC Driver 18 for SQL Server',
